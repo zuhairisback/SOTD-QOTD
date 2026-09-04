@@ -391,7 +391,8 @@ def build_song_embed(data: dict, pending: bool) -> discord.Embed:
     embed = discord.Embed(title=title, color=color)
     song_value = f"[{data['song']}]({data['source_link']})" if data.get("source_link") else data["song"]
     embed.add_field(name="Song", value=song_value, inline=False)
-    embed.add_field(name="From", value=data["from_who"], inline=False)
+    from_value = f"<@{data['from_who_id']}>" if data.get("from_who_id") else data["from_who"]
+    embed.add_field(name="From", value=from_value, inline=False)
     if data.get("lyrics"):
         embed.add_field(name="Favourite lyric", value=data["lyrics"], inline=False)
     if data.get("image_url"):
