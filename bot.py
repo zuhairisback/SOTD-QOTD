@@ -40,6 +40,10 @@ GUILD_ID = os.getenv("GUILD_ID")  # optional: speeds up slash command sync durin
 QOTD_CHANNEL_ID = int(os.getenv("QOTD_CHANNEL_ID", "0"))
 SOTD_CHANNEL_ID = int(os.getenv("SOTD_CHANNEL_ID", "0"))
 
+# Roles pinged when a Song/Question of the Day is actually published (not on the private draw).
+SOTD_ROLE_ID = int(os.getenv("SOTD_ROLE_ID", "0"))
+QOTD_ROLE_ID = int(os.getenv("QOTD_ROLE_ID", "0"))
+
 # Private channel where each day's draw is sent for review before it goes public.
 REVIEW_CHANNEL_ID = int(os.getenv("REVIEW_CHANNEL_ID", "0"))
 
@@ -330,9 +334,8 @@ def build_song_embed(data: dict, pending: bool) -> discord.Embed:
     title = "🎵 Pending Review — Song of the Day" if pending else "🎵 Song of the Day"
     color = discord.Color.orange() if pending else discord.Color.blurple()
     embed = discord.Embed(title=title, color=color)
-    if data.get("source_link"):
-        embed.url = data["source_link"]
-    embed.add_field(name="Song", value=data["song"], inline=False)
+    song_value = f"[{data['song']}]({data['source_link']})" if data.get("source_link") else data["song"]
+    embed.add_field(name="Song", value=song_value, inline=False)
     embed.add_field(name="From", value=data["from_who"], inline=False)
     if data.get("lyrics"):
         embed.add_field(name="Favourite lyric", value=data["lyrics"], inline=False)
@@ -344,7 +347,10 @@ def build_song_embed(data: dict, pending: bool) -> discord.Embed:
             "`/approve-sotd` to publish this • "
             "`/redraw-sotd` to skip it and draw another"
         )
-    embed.set_footer(text=f"Submitted by {data['username']}")
+        # Only the private review copy shows who really submitted it — the public
+        # post deliberately omits this so people can dedicate songs anonymously
+        # without giving away that it's actually their own pick.
+        embed.set_footer(text=f"Submitted by {data['username']}")
     return embed
 
 
@@ -364,7 +370,8 @@ def build_question_embed(data: dict, pending: bool) -> discord.Embed:
             ),
             inline=False,
         )
-    embed.set_footer(text=f"Submitted by {data['username']}")
+        # Same reasoning as the song embed — only visible in the private review copy.
+        embed.set_footer(text=f"Submitted by {data['username']}")
     return embed
 
 
@@ -558,7 +565,23 @@ async def approve(kind: str) -> bool:
         return False
 
     embed = build_song_embed(data, pending=False) if kind == "song" else build_question_embed(data, pending=False)
-    await public_channel.send(embed=embed)
+
+    mentions = []
+    if kind == "song":
+        if SOTD_ROLE_ID:
+            mentions.append(f"<@&{SOTD_ROLE_ID}>")
+        if data.get("from_who_id"):
+            mentions.append(f"<@{data['from_who_id']}>")
+    else:
+        if QOTD_ROLE_ID:
+            mentions.append(f"<@&{QOTD_ROLE_ID}>")
+    content = " ".join(mentions) if mentions else None
+
+    await public_channel.send(
+        content=content,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(roles=True, users=True, everyone=False),
+    )
     clear_pending(kind)
 
     try:
