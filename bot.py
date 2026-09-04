@@ -116,6 +116,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS scheduled (
             kind TEXT PRIMARY KEY,
             data TEXT NOT NULL,
+            review_message_id INTEGER,
+            review_channel_id INTEGER,
             created_at TEXT NOT NULL
         )
         """
@@ -126,6 +128,8 @@ def init_db():
         ("questions", "image_url", "TEXT"),
         ("songs", "from_who_id", "INTEGER"),
         ("songs", "source_link", "TEXT"),
+        ("scheduled", "review_message_id", "INTEGER"),
+        ("scheduled", "review_channel_id", "INTEGER"),
     ):
         existing_cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if col not in existing_cols:
@@ -270,15 +274,28 @@ def get_scheduled(kind: str):
     return row
 
 
-def set_scheduled(kind: str, data: dict):
+def set_scheduled(kind: str, data: dict, review_message_id: Optional[int] = None, review_channel_id: Optional[int] = None):
     conn = get_conn()
     conn.execute(
         """
-        INSERT INTO scheduled (kind, data, created_at) VALUES (?, ?, ?)
-        ON CONFLICT(kind) DO UPDATE SET data=excluded.data, created_at=excluded.created_at
+        INSERT INTO scheduled (kind, data, review_message_id, review_channel_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(kind) DO UPDATE SET
+            data=excluded.data,
+            review_message_id=excluded.review_message_id,
+            review_channel_id=excluded.review_channel_id,
+            created_at=excluded.created_at
         """,
-        (kind, json.dumps(data), datetime.datetime.now(TZ).isoformat()),
+        (kind, json.dumps(data), review_message_id, review_channel_id, datetime.datetime.now(TZ).isoformat()),
     )
+    conn.commit()
+    conn.close()
+
+
+def update_scheduled_data(kind: str, data: dict):
+    """Update just the data blob on an already-scheduled item, keeping its review message IDs intact."""
+    conn = get_conn()
+    conn.execute("UPDATE scheduled SET data = ? WHERE kind = ?", (json.dumps(data), kind))
     conn.commit()
     conn.close()
 
@@ -395,11 +412,16 @@ def build_song_embed(data: dict, pending: bool) -> discord.Embed:
     embed.add_field(name="From", value=from_value, inline=False)
     if data.get("lyrics"):
         embed.add_field(name="Favourite lyric", value=data["lyrics"], inline=False)
+    if data.get("genre"):
+        embed.add_field(name="Genre", value=data["genre"], inline=True)
+    if data.get("vibe"):
+        embed.add_field(name="Vibe", value=data["vibe"], inline=True)
     if data.get("image_url"):
         embed.set_image(url=data["image_url"])
     if pending:
         embed.description = (
             "`/edit-sotd-image` to add/replace the picture • "
+            "`/edit-sotd-details` to set genre/vibe • "
             "`/approve-sotd` to publish this • "
             "`/redraw-sotd` to skip it and draw another"
         )
@@ -659,7 +681,7 @@ async def approve(kind: str) -> str:
         return "none"
 
     data = json.loads(pending["data"])
-    set_scheduled(kind, data)
+    set_scheduled(kind, data, pending["review_message_id"], pending["review_channel_id"])
     clear_pending(kind)
 
     try:
@@ -724,6 +746,40 @@ async def set_pending_image(kind: str, image_url: str) -> bool:
         pass  # non-fatal — the DB is already updated, so /approve will still use the new image
 
     return True
+
+
+async def update_active_song_fields(field_updates: dict) -> str:
+    """Apply field_updates (e.g. {'genre': ..., 'vibe': ...}) to whichever state the
+    current song is in — still pending review, or already approved/scheduled — and
+    refresh the review channel embed either way. Returns 'pending', 'scheduled', or 'none'."""
+    pending = get_pending("song")
+    if pending:
+        data = json.loads(pending["data"])
+        data.update(field_updates)
+        update_pending_data("song", data)
+        try:
+            review_channel = bot.get_channel(pending["review_channel_id"])
+            review_msg = await review_channel.fetch_message(pending["review_message_id"])
+            await review_msg.edit(embed=build_song_embed(data, pending=True))
+        except Exception:
+            pass
+        return "pending"
+
+    scheduled = get_scheduled("song")
+    if scheduled:
+        data = json.loads(scheduled["data"])
+        data.update(field_updates)
+        update_scheduled_data("song", data)
+        try:
+            if scheduled["review_channel_id"] and scheduled["review_message_id"]:
+                review_channel = bot.get_channel(scheduled["review_channel_id"])
+                review_msg = await review_channel.fetch_message(scheduled["review_message_id"])
+                await review_msg.edit(embed=build_song_embed(data, pending=False))
+        except Exception:
+            pass
+        return "scheduled"
+
+    return "none"
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +911,38 @@ async def edit_sotd_image(interaction: discord.Interaction, image: discord.Attac
     await interaction.followup.send(
         "🖼️ Picture updated on the pending song." if ok else "Nothing is pending review right now.", ephemeral=True
     )
+
+
+@bot.tree.command(name="edit-sotd-details", description="[Admin] Set genre/vibe on the current song — works before OR after approving")
+@app_commands.describe(
+    genre="Genre of the song (e.g. Pop, Novelty - Polka)",
+    vibe="Vibe/mood description (e.g. Hype, I'm not quite sure)",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def edit_sotd_details(
+    interaction: discord.Interaction,
+    genre: Optional[str] = None,
+    vibe: Optional[str] = None,
+):
+    if not genre and not vibe:
+        await interaction.response.send_message("⚠️ Provide a `genre`, a `vibe`, or both.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    updates = {}
+    if genre:
+        updates["genre"] = genre
+    if vibe:
+        updates["vibe"] = vibe
+
+    state = await update_active_song_fields(updates)
+    if state == "none":
+        await interaction.followup.send("Nothing is pending or approved for song right now.", ephemeral=True)
+        return
+
+    label = "pending review" if state == "pending" else "already-approved (scheduled)"
+    await interaction.followup.send(f"✏️ Updated the {label} song's details.", ephemeral=True)
+
 
 
 @bot.tree.command(name="edit-qotd-image", description="[Admin] Add or replace the picture on the pending Question of the Day")
