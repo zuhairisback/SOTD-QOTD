@@ -22,10 +22,13 @@ pool for good, so nothing repeats.
 | `/redraw-qotd` | admins (Manage Server) | Skip the pending question (returns it to the pool) and draw a different one |
 | `/edit-sotd-image` | admins (Manage Server) | Attach or replace the picture on the pending song before approving |
 | `/edit-qotd-image` | admins (Manage Server) | Attach or replace the picture on the pending question before approving |
+| `/edit-sotd-details` | admins (Manage Server) | Set/update genre and vibe on the current song — works whether it's still pending review or already approved |
+| `/publish-sotd-now` | admins (Manage Server) | Instantly publish an already-approved song, skipping the wait for the daily time |
+| `/publish-qotd-now` | admins (Manage Server) | Instantly publish an already-approved question, skipping the wait for the daily time |
 
 Submissions are stored in a local SQLite file (`data.db`) — no external database needed.
 
-**The review workflow:** each day at the configured time, the bot draws one random song and one random question and posts them as an embed in your private `REVIEW_CHANNEL_ID` — not the public channels. From there, an admin runs `/approve-sotd` (or `-qotd`) to publish it for real, `/edit-sotd-image` first if it needs a picture, or `/redraw-sotd` to put it back and draw something else instead. If a draw is left un-reviewed, the bot won't draw a second one on top of it the next day — it just posts a reminder in the review channel until someone approves or redraws it. This means the daily schedule still runs like clockwork, but nothing reaches the public channel without a human glance first.
+**The review workflow:** each day at the configured time, the bot draws one random song and one random question and posts them as an embed in your private `REVIEW_CHANNEL_ID` — not the public channels. From there, an admin runs `/approve-sotd` (or `-qotd`) to **lock it in** — this does *not* post it right away. Approved items always go live at the next daily post time (e.g. 19:00), the same moment the bot draws the following day's pick. This means you can review and approve any time during the day at your own pace, and the actual public reveal always lands on schedule. If you want something out immediately instead of waiting, `/publish-sotd-now` / `/publish-qotd-now` bypass the wait. Before approving, `/edit-sotd-image` lets you attach a picture, and `/redraw-sotd` puts it back and draws something else instead. If a draw is left un-reviewed, the bot won't draw a second one on top of it the next day — it just posts a reminder in the review channel until someone approves or redraws it.
 
 **Adding a photo at submission time:** when running `/submit-song` or `/submit-question`, an `image` field appears as an optional attachment — tap it and pick a photo from your device before sending the command. Accepted formats are PNG, JPG, GIF, and WEBP, up to 8MB.
 
@@ -34,6 +37,14 @@ Submissions are stored in a local SQLite file (`data.db`) — no external databa
 **Who the song is from:** `from_who` is a real Discord member picker, not a text box — Discord shows a searchable dropdown of actual server members to choose from. This means people can't type a made-up or someone else's name to hide that a song is their own pick; the attribution is always tied to a genuine account.
 
 **Low-queue nudges:** if you set `NUDGE_CHANNEL_ID`, the bot posts a reminder there whenever a pool's remaining count drops to or below `NUDGE_THRESHOLD` (default 3) right after that day's draw — e.g. "only 2 songs left, submit yours!" — so the queue rarely runs dry unannounced.
+
+**Anonymity on published posts:** the private review copy (in `REVIEW_CHANNEL_ID`) shows who *actually* submitted a song or question, so admins can moderate it — but that "Submitted by" line is deliberately stripped from the version that goes public. This matters because `from_who` on a song is whoever the submitter picked, which might not be themselves — the point is to let people dedicate a song to someone else without it being obvious it was really their own pick. If the real submitter showed up publicly, that would give the game away every time.
+
+**Pings on publish:** when a song is published, the bot pings the `SOTD_ROLE_ID` role plus the `from_who` member directly (so the person it's dedicated to gets notified). When a question is published, it pings `QOTD_ROLE_ID`. Nothing is pinged during the private draw/review step — only on the actual public `/approve`.
+
+**Clickable song titles:** if a song has a Spotify/YouTube link (`source_link`), the song's name in the embed is a clickable hyperlink straight to that link — no separate "listen here" line needed.
+
+**Genre & vibe:** these are manual, judgment-call fields with no automatic source, so `/edit-sotd-details genre:... vibe:...` lets you set either or both at any point — while the song is still sitting in the review channel, *or* after you've already approved it (as long as it hasn't published yet). Either way the review channel's embed updates live so you can see the change take effect, and whatever's set when it actually publishes is what shows up on the public post.
 
 ## 1. Create the Discord bot application
 
