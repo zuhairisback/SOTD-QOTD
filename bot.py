@@ -111,6 +111,15 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scheduled (
+            kind TEXT PRIMARY KEY,
+            data TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     # Migration: add columns to databases created before these features existed.
     for table, col, coltype in (
         ("songs", "image_url", "TEXT"),
@@ -250,6 +259,52 @@ def clear_pending(kind: str):
     conn.execute("DELETE FROM pending WHERE kind = ?", (kind,))
     conn.commit()
     conn.close()
+
+
+# --- scheduled (approved, waiting for the next daily publish time) ---------
+
+def get_scheduled(kind: str):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM scheduled WHERE kind = ?", (kind,)).fetchone()
+    conn.close()
+    return row
+
+
+def set_scheduled(kind: str, data: dict):
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO scheduled (kind, data, created_at) VALUES (?, ?, ?)
+        ON CONFLICT(kind) DO UPDATE SET data=excluded.data, created_at=excluded.created_at
+        """,
+        (kind, json.dumps(data), datetime.datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_scheduled(kind: str):
+    conn = get_conn()
+    conn.execute("DELETE FROM scheduled WHERE kind = ?", (kind,))
+    conn.commit()
+    conn.close()
+
+
+def next_post_datetime() -> datetime.datetime:
+    """The next upcoming occurrence of POST_HOUR:POST_MINUTE — today if it hasn't
+    happened yet, otherwise tomorrow."""
+    now = datetime.datetime.now(TZ)
+    candidate = now.replace(hour=POST_HOUR, minute=POST_MINUTE, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += datetime.timedelta(days=1)
+    return candidate
+
+
+def describe_next_post_time() -> str:
+    dt = next_post_datetime()
+    now = datetime.datetime.now(TZ)
+    day_word = "today" if dt.date() == now.date() else "tomorrow"
+    return f"{day_word} at {dt.strftime('%H:%M')} {TIMEZONE}"
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +536,7 @@ async def submit_question(
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@bot.tree.command(name="qotd-sotd-status", description="See how many submissions are queued and what's pending review")
+@bot.tree.command(name="qotd-sotd-status", description="See how many submissions are queued and what's pending/scheduled")
 async def status(interaction: discord.Interaction):
     s, q = counts()
     lines = [f"📊 Currently queued: **{s}** song(s), **{q}** question(s)."]
@@ -495,6 +550,16 @@ async def status(interaction: discord.Interaction):
     if pending_question:
         data = json.loads(pending_question["data"])
         lines.append(f"❓ Pending review: \"{data['question']}\" — awaiting `/approve-qotd`.")
+
+    scheduled_song = get_scheduled("song")
+    if scheduled_song:
+        data = json.loads(scheduled_song["data"])
+        lines.append(f"✅ Approved, will publish {describe_next_post_time()}: **{data['song']}**")
+
+    scheduled_question = get_scheduled("question")
+    if scheduled_question:
+        data = json.loads(scheduled_question["data"])
+        lines.append(f"✅ Approved, will publish {describe_next_post_time()}: \"{data['question']}\"")
 
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -554,12 +619,9 @@ async def draw_and_review(kind: str) -> str:
     return "drawn"
 
 
-async def approve(kind: str) -> bool:
-    pending = get_pending(kind)
-    if not pending:
-        return False
-
-    data = json.loads(pending["data"])
+async def _publish(kind: str, data: dict) -> bool:
+    """Actually send the item to its public channel, with role/person pings. Used both
+    by the scheduled daily publish and by the instant /publish-*-now escape hatch."""
     public_channel = bot.get_channel(SOTD_CHANNEL_ID if kind == "song" else QOTD_CHANNEL_ID)
     if public_channel is None:
         return False
@@ -582,16 +644,43 @@ async def approve(kind: str) -> bool:
         embed=embed,
         allowed_mentions=discord.AllowedMentions(roles=True, users=True, everyone=False),
     )
+    return True
+
+
+async def approve(kind: str) -> str:
+    """Lock in the pending item to publish at the next daily post time (does NOT
+    post immediately). Returns a short status code."""
+    if get_scheduled(kind):
+        return "already-scheduled"
+
+    pending = get_pending(kind)
+    if not pending:
+        return "none"
+
+    data = json.loads(pending["data"])
+    set_scheduled(kind, data)
     clear_pending(kind)
 
     try:
         review_channel = bot.get_channel(pending["review_channel_id"])
         review_msg = await review_channel.fetch_message(pending["review_message_id"])
-        await review_msg.edit(content="✅ Approved and published.")
+        await review_msg.edit(content=f"✅ Approved — will publish {describe_next_post_time()}.")
     except Exception:
-        pass  # non-fatal — the important part (publishing) already succeeded
+        pass  # non-fatal — the approval itself already succeeded
 
-    return True
+    return "scheduled"
+
+
+async def publish_now(kind: str) -> bool:
+    """Escape hatch: instantly publish whatever's currently scheduled, bypassing the wait."""
+    scheduled = get_scheduled(kind)
+    if not scheduled:
+        return False
+    data = json.loads(scheduled["data"])
+    ok = await _publish(kind, data)
+    if ok:
+        clear_scheduled(kind)
+    return ok
 
 
 async def redraw(kind: str) -> str:
@@ -678,20 +767,50 @@ async def draw_qotd_now(interaction: discord.Interaction):
     await interaction.followup.send(messages.get(result, "Done."), ephemeral=True)
 
 
-@bot.tree.command(name="approve-sotd", description="[Admin] Publish the pending Song of the Day to the public channel")
+@bot.tree.command(name="approve-sotd", description="[Admin] Approve the pending song to publish at the next daily post time")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def approve_sotd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    ok = await approve("song")
-    await interaction.followup.send("✅ Published!" if ok else "Nothing is pending review right now.", ephemeral=True)
+    result = await approve("song")
+    messages = {
+        "scheduled": f"✅ Approved — will publish {describe_next_post_time()}.",
+        "none": "Nothing is pending review right now.",
+        "already-scheduled": "There's already an approved song waiting to publish — use `/publish-sotd-now` if you want it out immediately instead.",
+    }
+    await interaction.followup.send(messages.get(result, "Done."), ephemeral=True)
 
 
-@bot.tree.command(name="approve-qotd", description="[Admin] Publish the pending Question of the Day to the public channel")
+@bot.tree.command(name="approve-qotd", description="[Admin] Approve the pending question to publish at the next daily post time")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def approve_qotd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    ok = await approve("question")
-    await interaction.followup.send("✅ Published!" if ok else "Nothing is pending review right now.", ephemeral=True)
+    result = await approve("question")
+    messages = {
+        "scheduled": f"✅ Approved — will publish {describe_next_post_time()}.",
+        "none": "Nothing is pending review right now.",
+        "already-scheduled": "There's already an approved question waiting to publish — use `/publish-qotd-now` if you want it out immediately instead.",
+    }
+    await interaction.followup.send(messages.get(result, "Done."), ephemeral=True)
+
+
+@bot.tree.command(name="publish-sotd-now", description="[Admin] Instantly publish the already-approved song, skipping the wait for the scheduled time")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def publish_sotd_now(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    ok = await publish_now("song")
+    await interaction.followup.send(
+        "✅ Published immediately!" if ok else "Nothing is currently approved/scheduled for song.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="publish-qotd-now", description="[Admin] Instantly publish the already-approved question, skipping the wait for the scheduled time")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def publish_qotd_now(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    ok = await publish_now("question")
+    await interaction.followup.send(
+        "✅ Published immediately!" if ok else "Nothing is currently approved/scheduled for question.", ephemeral=True
+    )
 
 
 @bot.tree.command(name="redraw-sotd", description="[Admin] Skip the pending song and draw a different one")
@@ -758,12 +877,16 @@ async def edit_qotd_image(interaction: discord.Interaction, image: discord.Attac
 
 @tasks.loop(time=POST_TIME)
 async def daily_qotd():
+    if get_scheduled("question"):
+        await publish_now("question")
     if REVIEW_CHANNEL_ID:
         await draw_and_review("question")
 
 
 @tasks.loop(time=POST_TIME)
 async def daily_sotd():
+    if get_scheduled("song"):
+        await publish_now("song")
     if REVIEW_CHANNEL_ID:
         await draw_and_review("song")
 
