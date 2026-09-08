@@ -626,11 +626,8 @@ async def draw_and_review(kind: str) -> str:
 
     row = pop_random_song() if kind == "song" else pop_random_question()
     if row is None:
-        public_channel = bot.get_channel(SOTD_CHANNEL_ID if kind == "song" else QOTD_CHANNEL_ID)
-        if public_channel:
-            noun = "Song" if kind == "song" else "Question"
-            cmd = "/submit-song" if kind == "song" else "/submit-question"
-            await public_channel.send(f"😔 No {noun} of the Day submissions in the queue! Use `{cmd}` to add one.")
+        # Pool's empty — no message posted anywhere. Check /qotd-sotd-status if you
+        # want to know the queue is dry; the daily draw just quietly has nothing to do.
         return "empty"
 
     data = dict(row)
@@ -726,6 +723,30 @@ async def redraw(kind: str) -> str:
 
     clear_pending(kind)
     return await draw_and_review(kind)
+
+
+async def unapprove(kind: str) -> str:
+    """Cancel an already-approved/scheduled item, returning it to the pool unpublished."""
+    scheduled = get_scheduled(kind)
+    if not scheduled:
+        return "none"
+
+    data = json.loads(scheduled["data"])
+    if kind == "song":
+        return_song_to_pool(data)
+    else:
+        return_question_to_pool(data)
+
+    try:
+        if scheduled["review_channel_id"] and scheduled["review_message_id"]:
+            review_channel = bot.get_channel(scheduled["review_channel_id"])
+            review_msg = await review_channel.fetch_message(scheduled["review_message_id"])
+            await review_msg.edit(content="❌ Approval cancelled — returned to the pool, unpublished.")
+    except Exception:
+        pass
+
+    clear_scheduled(kind)
+    return "unapproved"
 
 
 async def set_pending_image(kind: str, image_url: str) -> bool:
@@ -894,6 +915,30 @@ async def redraw_qotd(interaction: discord.Interaction):
         "drawn": "Skipped — a new question has been drawn for review.",
         "empty": "Skipped — but the pool is now empty.",
         "no-review-channel": _require_review_channel_msg(),
+    }
+    await interaction.followup.send(messages.get(result, "Done."), ephemeral=True)
+
+
+@bot.tree.command(name="unapprove-sotd", description="[Admin] Cancel the approved song, returning it to the pool unpublished")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def unapprove_sotd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    result = await unapprove("song")
+    messages = {
+        "none": "Nothing is currently approved for song.",
+        "unapproved": "❌ Approval cancelled — the song is back in the pool, unpublished.",
+    }
+    await interaction.followup.send(messages.get(result, "Done."), ephemeral=True)
+
+
+@bot.tree.command(name="unapprove-qotd", description="[Admin] Cancel the approved question, returning it to the pool unpublished")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def unapprove_qotd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    result = await unapprove("question")
+    messages = {
+        "none": "Nothing is currently approved for question.",
+        "unapproved": "❌ Approval cancelled — the question is back in the pool, unpublished.",
     }
     await interaction.followup.send(messages.get(result, "Done."), ephemeral=True)
 
