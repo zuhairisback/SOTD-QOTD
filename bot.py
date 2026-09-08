@@ -114,7 +114,8 @@ def init_db():
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS scheduled (
-            kind TEXT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
             data TEXT NOT NULL,
             review_message_id INTEGER,
             review_channel_id INTEGER,
@@ -122,14 +123,39 @@ def init_db():
         )
         """
     )
+    # Migration: the old 'scheduled' table (before batch approval existed) had `kind`
+    # as its PRIMARY KEY, allowing only one approved-but-unpublished item at a time.
+    # If we detect that old shape, convert it into the new ordered-queue shape,
+    # carrying over anything that was already approved and waiting.
+    scheduled_cols = {row["name"] for row in conn.execute("PRAGMA table_info(scheduled)")}
+    if "id" not in scheduled_cols:
+        conn.execute("ALTER TABLE scheduled RENAME TO scheduled_old")
+        conn.execute(
+            """
+            CREATE TABLE scheduled (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                data TEXT NOT NULL,
+                review_message_id INTEGER,
+                review_channel_id INTEGER,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO scheduled (kind, data, review_message_id, review_channel_id, created_at)
+            SELECT kind, data, review_message_id, review_channel_id, created_at FROM scheduled_old
+            """
+        )
+        conn.execute("DROP TABLE scheduled_old")
+
     # Migration: add columns to databases created before these features existed.
     for table, col, coltype in (
         ("songs", "image_url", "TEXT"),
         ("questions", "image_url", "TEXT"),
         ("songs", "from_who_id", "INTEGER"),
         ("songs", "source_link", "TEXT"),
-        ("scheduled", "review_message_id", "INTEGER"),
-        ("scheduled", "review_channel_id", "INTEGER"),
     ):
         existing_cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if col not in existing_cols:
@@ -265,46 +291,79 @@ def clear_pending(kind: str):
     conn.close()
 
 
-# --- scheduled (approved, waiting for the next daily publish time) ---------
+# --- scheduled (an ORDERED QUEUE of approved items, waiting to publish one per day) ---
 
-def get_scheduled(kind: str):
+MAX_QUEUE_SIZE = 30  # sanity cap so a fat-fingered batch-approve can't run away forever
+
+
+def count_scheduled(kind: str) -> int:
     conn = get_conn()
-    row = conn.execute("SELECT * FROM scheduled WHERE kind = ?", (kind,)).fetchone()
+    n = conn.execute("SELECT COUNT(*) c FROM scheduled WHERE kind = ?", (kind,)).fetchone()["c"]
+    conn.close()
+    return n
+
+
+def queue_scheduled(kind: str, data: dict, review_message_id: Optional[int] = None, review_channel_id: Optional[int] = None) -> int:
+    """Append a newly-approved item to the back of the queue. Returns its 1-indexed position."""
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO scheduled (kind, data, review_message_id, review_channel_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        (kind, json.dumps(data), review_message_id, review_channel_id, datetime.datetime.now(TZ).isoformat()),
+    )
+    conn.commit()
+    position = conn.execute("SELECT COUNT(*) c FROM scheduled WHERE kind = ?", (kind,)).fetchone()["c"]
+    conn.close()
+    return position
+
+
+def peek_next_scheduled(kind: str):
+    """The item at the FRONT of the queue (next to publish), without removing it."""
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM scheduled WHERE kind = ? ORDER BY id ASC LIMIT 1", (kind,)).fetchone()
     conn.close()
     return row
 
 
-def set_scheduled(kind: str, data: dict, review_message_id: Optional[int] = None, review_channel_id: Optional[int] = None):
+def pop_next_scheduled(kind: str):
+    """Remove and return the item at the FRONT of the queue (used when actually publishing)."""
     conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO scheduled (kind, data, review_message_id, review_channel_id, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(kind) DO UPDATE SET
-            data=excluded.data,
-            review_message_id=excluded.review_message_id,
-            review_channel_id=excluded.review_channel_id,
-            created_at=excluded.created_at
-        """,
-        (kind, json.dumps(data), review_message_id, review_channel_id, datetime.datetime.now(TZ).isoformat()),
-    )
-    conn.commit()
+    row = conn.execute("SELECT * FROM scheduled WHERE kind = ? ORDER BY id ASC LIMIT 1", (kind,)).fetchone()
+    if row:
+        conn.execute("DELETE FROM scheduled WHERE id = ?", (row["id"],))
+        conn.commit()
     conn.close()
+    return row
 
 
-def update_scheduled_data(kind: str, data: dict):
-    """Update just the data blob on an already-scheduled item, keeping its review message IDs intact."""
+def pop_last_scheduled(kind: str):
+    """Remove and return the item at the BACK of the queue — i.e. the most recently
+    approved one. Used by /unapprove, matching an 'undo my last approval' expectation."""
     conn = get_conn()
-    conn.execute("UPDATE scheduled SET data = ? WHERE kind = ?", (json.dumps(data), kind))
-    conn.commit()
+    row = conn.execute("SELECT * FROM scheduled WHERE kind = ? ORDER BY id DESC LIMIT 1", (kind,)).fetchone()
+    if row:
+        conn.execute("DELETE FROM scheduled WHERE id = ?", (row["id"],))
+        conn.commit()
     conn.close()
+    return row
 
 
-def clear_scheduled(kind: str):
+def update_latest_scheduled_data(kind: str, data: dict):
+    """Update the data blob on whichever scheduled item was approved most recently
+    (used by /edit-sotd-details editing 'the current' item after approval)."""
     conn = get_conn()
-    conn.execute("DELETE FROM scheduled WHERE kind = ?", (kind,))
-    conn.commit()
+    row = conn.execute("SELECT id FROM scheduled WHERE kind = ? ORDER BY id DESC LIMIT 1", (kind,)).fetchone()
+    if row:
+        conn.execute("UPDATE scheduled SET data = ? WHERE id = ?", (json.dumps(data), row["id"]))
+        conn.commit()
     conn.close()
+    return row is not None
+
+
+def list_scheduled(kind: str, limit: int = 10):
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM scheduled WHERE kind = ? ORDER BY id ASC LIMIT ?", (kind, limit)).fetchall()
+    conn.close()
+    return rows
 
 
 def next_post_datetime() -> datetime.datetime:
@@ -322,6 +381,21 @@ def describe_next_post_time() -> str:
     now = datetime.datetime.now(TZ)
     day_word = "today" if dt.date() == now.date() else "tomorrow"
     return f"{day_word} at {dt.strftime('%H:%M')} {TIMEZONE}"
+
+
+def describe_publish_date_for_position(position: int) -> str:
+    """position is 1-indexed — position 1 publishes at the next post time, position 2
+    the day after that, and so on, assuming one publish happens per day."""
+    base = next_post_datetime()
+    target = base + datetime.timedelta(days=position - 1)
+    now = datetime.datetime.now(TZ)
+    if target.date() == now.date():
+        day_word = "today"
+    elif target.date() == (now.date() + datetime.timedelta(days=1)):
+        day_word = "tomorrow"
+    else:
+        day_word = f"on {target.strftime('%A, %b %d')}"
+    return f"{day_word} at {target.strftime('%H:%M')} {TIMEZONE}"
 
 
 # ---------------------------------------------------------------------------
@@ -574,15 +648,19 @@ async def status(interaction: discord.Interaction):
         data = json.loads(pending_question["data"])
         lines.append(f"❓ Pending review: \"{data['question']}\" — awaiting `/approve-qotd`.")
 
-    scheduled_song = get_scheduled("song")
-    if scheduled_song:
-        data = json.loads(scheduled_song["data"])
-        lines.append(f"✅ Approved, will publish {describe_next_post_time()}: **{data['song']}**")
+    song_queue = list_scheduled("song")
+    if song_queue:
+        lines.append(f"✅ **{len(song_queue)}** song(s) approved and queued:")
+        for i, row in enumerate(song_queue, start=1):
+            data = json.loads(row["data"])
+            lines.append(f"    {i}. **{data['song']}** — publishes {describe_publish_date_for_position(i)}")
 
-    scheduled_question = get_scheduled("question")
-    if scheduled_question:
-        data = json.loads(scheduled_question["data"])
-        lines.append(f"✅ Approved, will publish {describe_next_post_time()}: \"{data['question']}\"")
+    question_queue = list_scheduled("question")
+    if question_queue:
+        lines.append(f"✅ **{len(question_queue)}** question(s) approved and queued:")
+        for i, row in enumerate(question_queue, start=1):
+            data = json.loads(row["data"])
+            lines.append(f"    {i}. \"{data['question']}\" — publishes {describe_publish_date_for_position(i)}")
 
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -668,23 +746,26 @@ async def _publish(kind: str, data: dict) -> bool:
 
 
 async def approve(kind: str) -> str:
-    """Lock in the pending item to publish at the next daily post time (does NOT
-    post immediately). Returns a short status code."""
-    if get_scheduled(kind):
-        return "already-scheduled"
-
+    """Lock in the pending item onto the back of the publish queue (does NOT post
+    immediately). Multiple items can be approved in a row — they'll publish one per
+    day, in the order they were approved. Returns a short status code."""
     pending = get_pending(kind)
     if not pending:
         return "none"
 
+    if count_scheduled(kind) >= MAX_QUEUE_SIZE:
+        return "queue-full"
+
     data = json.loads(pending["data"])
-    set_scheduled(kind, data, pending["review_message_id"], pending["review_channel_id"])
+    position = queue_scheduled(kind, data, pending["review_message_id"], pending["review_channel_id"])
     clear_pending(kind)
 
     try:
         review_channel = bot.get_channel(pending["review_channel_id"])
         review_msg = await review_channel.fetch_message(pending["review_message_id"])
-        await review_msg.edit(content=f"✅ Approved — will publish {describe_next_post_time()}.")
+        when = describe_publish_date_for_position(position)
+        note = f"✅ Approved — queue position {position}, will publish {when}."
+        await review_msg.edit(content=note)
     except Exception:
         pass  # non-fatal — the approval itself already succeeded
 
@@ -692,15 +773,13 @@ async def approve(kind: str) -> str:
 
 
 async def publish_now(kind: str) -> bool:
-    """Escape hatch: instantly publish whatever's currently scheduled, bypassing the wait."""
-    scheduled = get_scheduled(kind)
-    if not scheduled:
+    """Publish whichever item is at the FRONT of the queue right now. Used both by the
+    daily scheduled publish and by the instant /publish-*-now escape hatch."""
+    row = pop_next_scheduled(kind)
+    if not row:
         return False
-    data = json.loads(scheduled["data"])
-    ok = await _publish(kind, data)
-    if ok:
-        clear_scheduled(kind)
-    return ok
+    data = json.loads(row["data"])
+    return await _publish(kind, data)
 
 
 async def redraw(kind: str) -> str:
@@ -726,26 +805,26 @@ async def redraw(kind: str) -> str:
 
 
 async def unapprove(kind: str) -> str:
-    """Cancel an already-approved/scheduled item, returning it to the pool unpublished."""
-    scheduled = get_scheduled(kind)
-    if not scheduled:
+    """Cancel the MOST RECENTLY approved item (back of the queue) — matches an 'undo
+    my last approval' expectation — returning it to the pool unpublished."""
+    row = pop_last_scheduled(kind)
+    if not row:
         return "none"
 
-    data = json.loads(scheduled["data"])
+    data = json.loads(row["data"])
     if kind == "song":
         return_song_to_pool(data)
     else:
         return_question_to_pool(data)
 
     try:
-        if scheduled["review_channel_id"] and scheduled["review_message_id"]:
-            review_channel = bot.get_channel(scheduled["review_channel_id"])
-            review_msg = await review_channel.fetch_message(scheduled["review_message_id"])
+        if row["review_channel_id"] and row["review_message_id"]:
+            review_channel = bot.get_channel(row["review_channel_id"])
+            review_msg = await review_channel.fetch_message(row["review_message_id"])
             await review_msg.edit(content="❌ Approval cancelled — returned to the pool, unpublished.")
     except Exception:
         pass
 
-    clear_scheduled(kind)
     return "unapproved"
 
 
@@ -786,11 +865,15 @@ async def update_active_song_fields(field_updates: dict) -> str:
             pass
         return "pending"
 
-    scheduled = get_scheduled("song")
+    conn = get_conn()
+    scheduled = conn.execute(
+        "SELECT * FROM scheduled WHERE kind = 'song' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
     if scheduled:
         data = json.loads(scheduled["data"])
         data.update(field_updates)
-        update_scheduled_data("song", data)
+        update_latest_scheduled_data("song", data)
         try:
             if scheduled["review_channel_id"] and scheduled["review_message_id"]:
                 review_channel = bot.get_channel(scheduled["review_channel_id"])
@@ -845,33 +928,39 @@ async def draw_qotd_now(interaction: discord.Interaction):
     await interaction.followup.send(messages.get(result, "Done."), ephemeral=True)
 
 
-@bot.tree.command(name="approve-sotd", description="[Admin] Approve the pending song to publish at the next daily post time")
+@bot.tree.command(name="approve-sotd", description="[Admin] Approve the pending song — publishes one per day, in the order approved")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def approve_sotd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     result = await approve("song")
-    messages = {
-        "scheduled": f"✅ Approved — will publish {describe_next_post_time()}.",
-        "none": "Nothing is pending review right now.",
-        "already-scheduled": "There's already an approved song waiting to publish — use `/publish-sotd-now` if you want it out immediately instead.",
-    }
-    await interaction.followup.send(messages.get(result, "Done."), ephemeral=True)
+    if result == "scheduled":
+        position = count_scheduled("song")
+        msg = f"✅ Approved — queue position {position}, will publish {describe_publish_date_for_position(position)}."
+    else:
+        msg = {
+            "none": "Nothing is pending review right now.",
+            "queue-full": f"The approved queue is full (max {MAX_QUEUE_SIZE}) — publish some off with `/publish-sotd-now` first.",
+        }.get(result, "Done.")
+    await interaction.followup.send(msg, ephemeral=True)
 
 
-@bot.tree.command(name="approve-qotd", description="[Admin] Approve the pending question to publish at the next daily post time")
+@bot.tree.command(name="approve-qotd", description="[Admin] Approve the pending question — publishes one per day, in the order approved")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def approve_qotd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     result = await approve("question")
-    messages = {
-        "scheduled": f"✅ Approved — will publish {describe_next_post_time()}.",
-        "none": "Nothing is pending review right now.",
-        "already-scheduled": "There's already an approved question waiting to publish — use `/publish-qotd-now` if you want it out immediately instead.",
-    }
-    await interaction.followup.send(messages.get(result, "Done."), ephemeral=True)
+    if result == "scheduled":
+        position = count_scheduled("question")
+        msg = f"✅ Approved — queue position {position}, will publish {describe_publish_date_for_position(position)}."
+    else:
+        msg = {
+            "none": "Nothing is pending review right now.",
+            "queue-full": f"The approved queue is full (max {MAX_QUEUE_SIZE}) — publish some off with `/publish-qotd-now` first.",
+        }.get(result, "Done.")
+    await interaction.followup.send(msg, ephemeral=True)
 
 
-@bot.tree.command(name="publish-sotd-now", description="[Admin] Instantly publish the already-approved song, skipping the wait for the scheduled time")
+@bot.tree.command(name="publish-sotd-now", description="[Admin] Instantly publish the NEXT song in the approved queue, skipping the wait")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def publish_sotd_now(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -881,7 +970,7 @@ async def publish_sotd_now(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="publish-qotd-now", description="[Admin] Instantly publish the already-approved question, skipping the wait for the scheduled time")
+@bot.tree.command(name="publish-qotd-now", description="[Admin] Instantly publish the NEXT question in the approved queue, skipping the wait")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def publish_qotd_now(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -1011,7 +1100,7 @@ async def edit_qotd_image(interaction: discord.Interaction, image: discord.Attac
 
 @tasks.loop(time=POST_TIME)
 async def daily_qotd():
-    if get_scheduled("question"):
+    if count_scheduled("question") > 0:
         await publish_now("question")
     if REVIEW_CHANNEL_ID:
         await draw_and_review("question")
@@ -1019,7 +1108,7 @@ async def daily_qotd():
 
 @tasks.loop(time=POST_TIME)
 async def daily_sotd():
-    if get_scheduled("song"):
+    if count_scheduled("song") > 0:
         await publish_now("song")
     if REVIEW_CHANNEL_ID:
         await draw_and_review("song")
