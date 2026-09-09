@@ -633,7 +633,8 @@ async def submit_question(
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@bot.tree.command(name="qotd-sotd-status", description="See how many submissions are queued and what's pending/scheduled")
+@bot.tree.command(name="qotd-sotd-status", description="[Admin] See how many submissions are queued and what's pending/scheduled")
+@app_commands.checks.has_permissions(manage_guild=True)
 async def status(interaction: discord.Interaction):
     s, q = counts()
     lines = [f"📊 Currently queued: **{s}** song(s), **{q}** question(s)."]
