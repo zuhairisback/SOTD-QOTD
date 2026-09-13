@@ -686,10 +686,11 @@ async def status(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-@bot.tree.command(name="clear-submissions", description="[Admin] Permanently delete submissions from the pool (does NOT touch pending/approved items)")
+@bot.tree.command(name="clear-submissions", description="[Admin] Permanently delete submissions from the pool")
 @app_commands.describe(
-    scope="What to delete",
+    scope="What to delete from the pool",
     confirm="Must be True to actually delete anything — this cannot be undone",
+    also_clear_pending="Also discard any item currently stuck awaiting review (does NOT touch already-approved items)",
 )
 @app_commands.choices(scope=[
     app_commands.Choice(name="Everything (songs + questions)", value="all"),
@@ -697,11 +698,17 @@ async def status(interaction: discord.Interaction):
     app_commands.Choice(name="Questions only", value="questions"),
 ])
 @app_commands.checks.has_permissions(manage_guild=True)
-async def clear_submissions(interaction: discord.Interaction, scope: app_commands.Choice[str], confirm: bool = False):
+async def clear_submissions(
+    interaction: discord.Interaction,
+    scope: app_commands.Choice[str],
+    confirm: bool = False,
+    also_clear_pending: bool = False,
+):
     if not confirm:
+        pending_note = " and discard anything currently awaiting review" if also_clear_pending else ""
         await interaction.response.send_message(
-            f"⚠️ This will **permanently delete** all unreviewed submissions matching scope `{scope.name}`. "
-            "This cannot be undone. It will NOT touch anything already pending review or already approved. "
+            f"⚠️ This will **permanently delete** all unreviewed submissions matching scope `{scope.name}`{pending_note}. "
+            "This cannot be undone. It will NOT touch anything already approved and queued. "
             "Re-run this command with `confirm:True` to actually do it.",
             ephemeral=True,
         )
@@ -709,10 +716,20 @@ async def clear_submissions(interaction: discord.Interaction, scope: app_command
 
     await interaction.response.defer(ephemeral=True)
     songs_deleted, questions_deleted = clear_pool(scope.value)
-    await interaction.followup.send(
-        f"🗑️ Deleted **{songs_deleted}** song(s) and **{questions_deleted}** question(s) from the pool.",
-        ephemeral=True,
-    )
+
+    pending_discarded = []
+    if also_clear_pending:
+        if scope.value in ("all", "songs") and await discard_pending("song"):
+            pending_discarded.append("song")
+        if scope.value in ("all", "questions") and await discard_pending("question"):
+            pending_discarded.append("question")
+
+    msg = f"🗑️ Deleted **{songs_deleted}** song(s) and **{questions_deleted}** question(s) from the pool."
+    if pending_discarded:
+        msg += f" Also discarded the pending {' and '.join(pending_discarded)} awaiting review."
+    elif also_clear_pending:
+        msg += " (Nothing was actually pending review to discard.)"
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +869,25 @@ async def redraw(kind: str) -> str:
 
     clear_pending(kind)
     return await draw_and_review(kind)
+
+
+async def discard_pending(kind: str) -> bool:
+    """Permanently discard the current pending item — does NOT return it to the pool
+    (unlike redraw) and does NOT draw a replacement. Used by /clear-submissions'
+    'also clear pending' option to fully unstick a forgotten review."""
+    pending = get_pending(kind)
+    if not pending:
+        return False
+
+    try:
+        review_channel = bot.get_channel(pending["review_channel_id"])
+        review_msg = await review_channel.fetch_message(pending["review_message_id"])
+        await review_msg.edit(content="🗑️ Discarded by an admin.")
+    except Exception:
+        pass
+
+    clear_pending(kind)
+    return True
 
 
 async def unapprove(kind: str) -> str:
