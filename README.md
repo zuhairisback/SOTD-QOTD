@@ -25,6 +25,9 @@ pool for good, so nothing repeats.
 | `/edit-sotd-details` | admins (Manage Server) | Set/update genre and vibe on the current song — works whether it's still pending review or already approved |
 | `/publish-sotd-now` | admins (Manage Server) | Instantly publish an already-approved song, skipping the wait for the daily time |
 | `/publish-qotd-now` | admins (Manage Server) | Instantly publish an already-approved question, skipping the wait for the daily time |
+| `/unapprove-sotd` | admins (Manage Server) | Cancel your most recent song approval, returning it to the pool unpublished |
+| `/unapprove-qotd` | admins (Manage Server) | Cancel your most recent question approval, returning it to the pool unpublished |
+| `/clear-submissions` | admins (Manage Server) | Permanently delete unreviewed submissions (all/songs/questions), with an option to also discard anything stuck pending review |
 
 Submissions are stored in a local SQLite file (`data.db`) — no external database needed.
 
@@ -45,6 +48,8 @@ Submissions are stored in a local SQLite file (`data.db`) — no external databa
 **Clickable song titles:** if a song has a Spotify/YouTube link (`source_link`), the song's name in the embed is a clickable hyperlink straight to that link — no separate "listen here" line needed.
 
 **Genre & vibe:** these are manual, judgment-call fields with no automatic source, so `/edit-sotd-details genre:... vibe:...` lets you set either or both at any point — while the song is still sitting in the review channel, *or* after you've already approved it (as long as it hasn't published yet). Either way the review channel's embed updates live so you can see the change take effect, and whatever's set when it actually publishes is what shows up on the public post.
+
+**Clearing submissions:** `/clear-submissions` lets you wipe unreviewed songs, questions, or both from the pool — useful for a fresh start or clearing spam. It's deliberately hard to trigger by accident: running it without `confirm:True` just shows you a warning and does nothing. By default it only touches the raw pool — anything already drawn for review or already approved is left alone. If something's been sitting drawn-but-unreviewed for a while and you just want it gone rather than approved or redrawn, set `also_clear_pending:True` to discard it too (this still never touches anything already approved/queued — only the pool and the pending review slot).
 
 ## 1. Create the Discord bot application
 
