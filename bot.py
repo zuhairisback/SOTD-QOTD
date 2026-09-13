@@ -233,6 +233,26 @@ def counts():
     return s, q
 
 
+def clear_pool(scope: str) -> tuple[int, int]:
+    """Permanently delete submissions from the raw pool. scope is 'all', 'songs', or
+    'questions'. Does NOT touch anything already drawn (pending) or approved
+    (scheduled) — only unreviewed submissions still sitting in the pool.
+    Returns (songs_deleted, questions_deleted)."""
+    conn = get_conn()
+    s_count = conn.execute("SELECT COUNT(*) c FROM songs").fetchone()["c"]
+    q_count = conn.execute("SELECT COUNT(*) c FROM questions").fetchone()["c"]
+    if scope in ("all", "songs"):
+        conn.execute("DELETE FROM songs")
+    if scope in ("all", "questions"):
+        conn.execute("DELETE FROM questions")
+    conn.commit()
+    conn.close()
+    return (
+        s_count if scope in ("all", "songs") else 0,
+        q_count if scope in ("all", "questions") else 0,
+    )
+
+
 def return_song_to_pool(data: dict):
     add_song(
         data["user_id"],
@@ -664,6 +684,35 @@ async def status(interaction: discord.Interaction):
             lines.append(f"    {i}. \"{data['question']}\" — publishes {describe_publish_date_for_position(i)}")
 
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="clear-submissions", description="[Admin] Permanently delete submissions from the pool (does NOT touch pending/approved items)")
+@app_commands.describe(
+    scope="What to delete",
+    confirm="Must be True to actually delete anything — this cannot be undone",
+)
+@app_commands.choices(scope=[
+    app_commands.Choice(name="Everything (songs + questions)", value="all"),
+    app_commands.Choice(name="Songs only", value="songs"),
+    app_commands.Choice(name="Questions only", value="questions"),
+])
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clear_submissions(interaction: discord.Interaction, scope: app_commands.Choice[str], confirm: bool = False):
+    if not confirm:
+        await interaction.response.send_message(
+            f"⚠️ This will **permanently delete** all unreviewed submissions matching scope `{scope.name}`. "
+            "This cannot be undone. It will NOT touch anything already pending review or already approved. "
+            "Re-run this command with `confirm:True` to actually do it.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    songs_deleted, questions_deleted = clear_pool(scope.value)
+    await interaction.followup.send(
+        f"🗑️ Deleted **{songs_deleted}** song(s) and **{questions_deleted}** question(s) from the pool.",
+        ephemeral=True,
+    )
 
 
 # ---------------------------------------------------------------------------
